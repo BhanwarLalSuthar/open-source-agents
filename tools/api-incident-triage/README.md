@@ -44,25 +44,28 @@
 ## Architecture & Data Flow
 
 ```
-file or stdin
-    |
-    v
-CLI (--json optional) (src/index.mjs)
-    |
-    v
+file / stdin / MCP tool args
+         |
+         v
 Local secret redaction (redactSecrets)
-    |
-    v
+         |
+         v
 Multi-signal rule engine (localTriage)
-    |  collects all matches → ranks primary → severity/confidence
-    |  playbook + risk score + blast radius
-    v
-Pretty report / JSON / markdown --report
+  · all matches → ranked primary + secondary
+  · severity / confidence / evidence snippets
+  · risk score + blast radius + playbook
+         |
+    +----+----+------------------+
+    |         |                  |
+    v         v                  v
+  CLI      --report.md      MCP stdio server
+ (pretty/JSON)              · open incidents → RAM
+                            · close → reports/cases/ (disk)
          ^
-Failure Lab (lab/server.mjs) writes synthetic boom logs → lab/lab.log
+Failure Lab (lab/server.mjs) → synthetic boom logs → lab/lab.log
 ```
 
-Core triage logic is pure. The lab is an optional local HTTP process for demos.
+Core triage is pure heuristics (no LLM, no network). The lab and MCP server are optional surfaces on the same core.
 
 ---
 
@@ -223,15 +226,27 @@ DATABASE_URL=postgresql://demo-user:demo-password@localhost:5432/demo_app
 ### Example Output
 
 ```text
-StackSentry — Local incident triage
-────────────────────────────────────
-Incident:  [HIGH] database-schema: PostgreSQL may be unable to find a referenced table or relation. Also seen: http-500.
-Severity:  high
-Primary:   database-schema
-Confidence: high (heuristic — verify against the system)
+╔══════════════════════════════════════╗
+║           StackSentry                ║
+║   Local API incident triage (offline)║
+╚══════════════════════════════════════╝
+
+Incident card
+─────────────
+  [HIGH] database-schema: PostgreSQL may be unable to find a referenced table or relation. Also seen: http-500.
+
+Risk score:  92/100
+Severity:    high
+Primary:     database-schema
+Owner hint:  Backend / data
+Confidence:  high (heuristic — verify)
+Signals:     2
 
 Likely cause: PostgreSQL may be unable to find a referenced table or relation.
-Evidence: Matched SQLSTATE 42P01 (undefined_table).
+Evidence:     Matched SQLSTATE 42P01 (undefined_table).
+
+Blast radius:
+  Reads/writes against missing relations fail; user-facing 5xx likely until migrations align.
 
 Also detected:
   • http-500 (medium confidence, high severity)
@@ -239,18 +254,24 @@ Also detected:
 Evidence snippets (sanitized):
   | DatabaseError: relation "users" does not exist
   | SQLSTATE: 42P01
-  | ... status=500 ...
+  | 2026-10-24T08:45:13.112Z ERROR request_id=req_demo_001 method=POST path=/api/users status=500
+
+Playbook:
+  1. Confirm environment and database name (dev vs staging vs prod).
+  2. Diff expected schema vs live (migrations, search_path, identifier casing).
+  3. Block related deploys until the relation exists or the query is corrected.
+  4. Re-run a single synthetic request and confirm the 42P01 signal is gone.
 
 Suggested checks:
   1. Confirm the application is connected to the intended database and environment.
   2. Check the relation name, identifier casing, active schema, and search_path.
   3. Verify that the expected migrations ran successfully in this environment.
 
-Privacy: common secret patterns are redacted locally; redaction is best-effort.
+Privacy: redaction is local and best-effort.
 Note: diagnosis is heuristic, not a proven root cause.
 ```
 
-The CLI does not dump the raw log. Use `--json` for the full structured payload (`signals`, `secondary`, `evidenceSnippets`, `summary`).
+The CLI does not dump the raw log. Use `--json` for the full structured payload (`signals`, `secondary`, `evidenceSnippets`, `riskScore`, `playbook`, `summary`).
 
 ### Second example (`examples/connection-refused.log`)
 
@@ -302,17 +323,19 @@ Tests use only Node built-ins and require no network access.
 - Diagnosis is heuristic, not a verified root cause. Always confirm against surrounding application, database, and infrastructure evidence.
 - Only the listed patterns are recognized; other failures fall back to a generic diagnostic.
 - Unknown secret formats may not be redacted. Treat redaction as best-effort, not a DLP product.
-- The CLI returns plain text (not JSON) and never modifies systems or applies fixes.
+- The tool never modifies systems or applies fixes; it only suggests checks.
+- Open MCP incident sessions live in process RAM only — restarting the MCP server clears open cases (closed cases remain under `reports/cases/` until deleted).
 - Broad “timeout” wording can produce false positives in unrelated log noise.
+- Combined Failure Lab logs often pick `database-schema` as primary when many boom routes are mixed; use per-route triage to inspect each class.
 
 ---
 
 ## Security & Privacy Considerations
 
-- **Secrets Handling**: Common credential patterns are redacted locally before any report is produced. No `.env` is required or loaded.
-- **Data Privacy**: The MVP transmits nothing. There is no telemetry, subprocess execution, or database connection.
+- **Secrets Handling**: Common credential patterns are redacted locally before any report is produced. No `.env` is required or loaded for triage.
+- **Data Privacy**: Triage transmits nothing. There is no telemetry. Failure Lab binds to localhost only.
 - **Safety**: The tool never executes remediation commands, migrations, or shell actions based on the log.
-- Do not commit real credentials, customer data, or production logs. Examples and tests use synthetic values only.
+- Do not commit real credentials, customer data, or production logs. Examples and tests use synthetic values only. `reports/` and `lab/lab.log` are gitignored.
 
 ---
 
@@ -320,10 +343,10 @@ Tests use only Node built-ins and require no network access.
 
 - [ ] Optional, explicitly opt-in hosted-model explanation mode (sanitized payload only; disabled by default)
 - [ ] Additional safe diagnostic rules from synthetic fixtures
-- [ ] MCP server wrapper for editor/agent integration
+- [ ] Persist open incident sessions across MCP restarts (opt-in)
 
 ---
 
 ## License
 
-This project is contributed under the repository's open-source license.
+MIT (see `package.json`). This project is contributed under the repository's open-source license.
